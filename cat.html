@@ -186,12 +186,17 @@
     </div>
   </header>
   <div id="fx"></div>
-  <div id="error">Ginger needs WebGL and an internet connection to load the 3D engine. Try another browser.</div>
+  <div id="error">Ginger couldn't load. She needs an internet connection and a browser with 3D graphics (WebGL). Check your connection and refresh the page.</div>
+<script>
+  // If the 3D module fails to load (offline, CDN blocked) it never runs, so watch for it from here
+  window.showKittyError = () => { document.getElementById('error').style.display = 'block'; };
+  setTimeout(() => { if (!window.kittyReady) window.showKittyError(); }, 15000);
+</script>
 
 <script type="importmap">
   { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
 </script>
-<script type="module">
+<script type="module" onerror="showKittyError()">
 import * as THREE from 'three';
 
 // =====================================================================
@@ -202,7 +207,7 @@ let renderer;
 try {
   renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
 } catch (e) {
-  document.getElementById('error').style.display = 'block';
+  window.showKittyError();
   throw e;
 }
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -648,7 +653,14 @@ function loop(now) {
   if (time > blinkAt && time < blinkAt + 0.14) T.eye *= 0.05;
   const fast = mode === 'walk' || mode === 'run' || mode === 'dance' || mode === 'swipe';
   const a = 1 - Math.exp(-dt * (fast ? 22 : 9));
-  for (const k in T) C[k] = SNAP.has(k) ? T[k] : C[k] + (T[k] - C[k]) * a;
+  for (const k in T) {
+    if (!SNAP.has(k)) { C[k] += (T[k] - C[k]) * a; continue; }
+    if (T[k] !== 0) { C[k] = T[k]; continue; }   // mid-trick: follow the rotation exactly
+    // trick over or interrupted: ease to the nearest upright angle (a full turn counts as upright)
+    const upright = Math.round(C[k] / (Math.PI * 2)) * Math.PI * 2;
+    C[k] += (upright - C[k]) * a;
+    if (Math.abs(C[k] - upright) < 1e-3) C[k] = 0;
+  }
   applyPose(C);
 
   // yarn ball physics
@@ -703,24 +715,29 @@ function makeCtx() {
   }
   // walk/run to a point: turn toward it, move forward, legs driven by distance travelled
   async function moveTo(tx, tz, speed, gaitMode = 'walk', stopDist = 0.05) {
-    const r = Math.hypot(tx, tz);
-    if (r > AREA) { tx *= AREA / r; tz *= AREA / r; }
-    onBed = false;
+    [tx, tz] = clampToArea(tx, tz);
     setMode(gaitMode);
-    const stride = gaitMode === 'run' ? 1.1 : 0.55;
-    while (true) {
-      const dt = await frame();
-      const dx = tx - cat.x, dz = tz - cat.z, dist = Math.hypot(dx, dz);
-      if (dist < stopDist) return;
-      const d = angDiff(Math.atan2(dx, dz), cat.yaw);
-      cat.yaw += Math.sign(d) * Math.min(Math.abs(d), 7 * dt);
-      const step = Math.min(dist, speed * dt * Math.max(0.15, Math.cos(d)));
-      cat.x += Math.sin(cat.yaw) * step;
-      cat.z += Math.cos(cat.yaw) * step;
-      gait = (gait + step / stride) % 1;
+    while (Math.hypot(tx - cat.x, tz - cat.z) >= stopDist) {
+      stepToward(tx, tz, speed, gaitMode, await frame());
     }
   }
   return { alive, wait, frame, turnTo, moveTo };
+}
+
+const STRIDE = { walk: 0.55, run: 1.1 };   // ground covered per gait cycle
+function clampToArea(x, z) {
+  const r = Math.hypot(x, z);
+  return r > AREA ? [x * AREA / r, z * AREA / r] : [x, z];
+}
+// One frame of walking/running toward a point (shared by moveTo and the laser chase)
+function stepToward(tx, tz, speed, gaitMode, dt, stopDist = 0) {
+  onBed = false;
+  const dx = tx - cat.x, dz = tz - cat.z, dist = Math.hypot(dx, dz);
+  const d = angDiff(Math.atan2(dx, dz), cat.yaw);
+  cat.yaw += Math.sign(d) * Math.min(Math.abs(d), 7 * dt);
+  const step = clamp(dist - stopDist, 0, speed * dt * Math.max(0.15, Math.cos(d)));
+  [cat.x, cat.z] = clampToArea(cat.x + Math.sin(cat.yaw) * step, cat.z + Math.cos(cat.yaw) * step);
+  gait = (gait + step / STRIDE[gaitMode]) % 1;
 }
 
 let userBusy = false;
@@ -728,7 +745,13 @@ async function perform(fn, user = false) {
   const c = makeCtx();
   userBusy = user;
   try { await fn(c); }
-  catch (e) { if (!(e instanceof Cancel)) console.error(e); return; }
+  catch (e) {
+    if (e instanceof Cancel) return;
+    console.error(e);
+    // recover after a pause (the pause stops a repeating error from spinning)
+    setTimeout(() => { if (c.alive()) { userBusy = false; resumeDefault(); } }, 1000);
+    return;
+  }
   if (c.alive()) { userBusy = false; resumeDefault(); }
 }
 function resumeDefault() { perform(laserOn ? chase : (petting ? petted : roam)); }
@@ -777,29 +800,39 @@ const moves = {
     setMode('stand'); await c.wait(300);
   },
   async ball(c) {
+    const ballDist = () => Math.hypot(ball.position.x - cat.x, ball.position.z - cat.z);
     for (let round = 0; round < 3; round++) {
-      const P = ball.position;
-      const [ax, az] = approach(P, 0.6);
-      await c.moveTo(ax, az, Math.hypot(ax - cat.x, az - cat.z) > 1.5 ? 3 : 1.1, Math.hypot(ax - cat.x, az - cat.z) > 1.5 ? 'run' : 'walk');
-      await c.turnTo(P.x, P.z);
+      // the ball may still be rolling, so keep re-approaching until it's within reach
+      for (let tries = 0; tries < 4 && ballDist() > 0.85; tries++) {
+        const [ax, az] = approach(ball.position, 0.6);
+        const far = Math.hypot(ax - cat.x, az - cat.z) > 1.5;
+        await c.moveTo(ax, az, far ? 3 : 1.1, far ? 'run' : 'walk');
+      }
+      if (ballDist() > 0.85) break;   // couldn't reach it (e.g. stuck at the rug edge)
+      await c.turnTo(ball.position.x, ball.position.z);
       setMode('crouch'); await c.wait(rand(500, 900));
       restartMode('swipe'); await c.wait(220);
-      const dir = new THREE.Vector3(Math.sin(cat.yaw), 0, Math.cos(cat.yaw));
-      dir.applyAxisAngle(new THREE.Vector3(0, 1, 0), rand(-0.5, 0.5));
-      ballVel.copy(dir.multiplyScalar(rand(2.5, 3.8)));
-      spawn('💥');
+      if (ballDist() < 0.95) {
+        const dir = new THREE.Vector3(Math.sin(cat.yaw), 0, Math.cos(cat.yaw));
+        dir.applyAxisAngle(new THREE.Vector3(0, 1, 0), rand(-0.5, 0.5));
+        ballVel.copy(dir.multiplyScalar(rand(2.5, 3.8)));
+        spawn('💥');
+      }
       await c.wait(400);
       setMode('stand'); await c.wait(500);
     }
   },
   async feed(c) {
     fish.visible = true;
-    const [ax, az] = approach(BOWL, 0.75);
-    await c.moveTo(ax, az, 2.8, 'run');
-    await c.turnTo(BOWL.x, BOWL.z);
-    setMode('eat');
-    for (let i = 0; i < 6; i++) { spawn(i % 2 ? '😋' : '💕'); await c.wait(500); }
-    fish.visible = false;
+    try {
+      const [ax, az] = approach(BOWL, 0.75);
+      await c.moveTo(ax, az, 2.8, 'run');
+      await c.turnTo(BOWL.x, BOWL.z);
+      setMode('eat');
+      for (let i = 0; i < 6; i++) { spawn(i % 2 ? '😋' : '💕'); await c.wait(500); }
+    } finally {
+      fish.visible = false;
+    }
     setMode('stand'); meow(); await c.wait(800);
   },
   async sleep(c) {
@@ -821,8 +854,8 @@ for (const [name, fn] of Object.entries(moves)) {
 // move along with a hop without changing the pose mode
 async function hopForward(c, tx, tz, dur) {
   const sx = cat.x, sz = cat.z, start = performance.now();
-  const r = Math.hypot(tx, tz);
-  if (r > AREA) { tx *= AREA / r; tz *= AREA / r; }
+  [tx, tz] = clampToArea(tx, tz);
+  onBed = false;
   try {
     while (true) {
       await c.frame();
@@ -864,14 +897,9 @@ async function chase(c) {
   while (true) {
     const dx = laserPos.x - cat.x, dz = laserPos.z - cat.z, d = Math.hypot(dx, dz);
     if (d > 0.9) {
-      const fast = d > 2.2;
-      setMode(fast ? 'run' : 'walk');
-      const dt = await c.frame();
-      const want = Math.atan2(dx, dz), diff = angDiff(want, cat.yaw);
-      cat.yaw += Math.sign(diff) * Math.min(Math.abs(diff), 8 * dt);
-      const step = Math.min(d - 0.8, (fast ? 3.4 : 1.2) * dt * Math.max(0.2, Math.cos(diff)));
-      cat.x += Math.sin(cat.yaw) * step; cat.z += Math.cos(cat.yaw) * step;
-      gait = (gait + step / (fast ? 1.1 : 0.55)) % 1;
+      const gaitMode = d > 2.2 ? 'run' : 'walk';
+      setMode(gaitMode);
+      stepToward(laserPos.x, laserPos.z, gaitMode === 'run' ? 3.4 : 1.2, gaitMode, await c.frame(), 0.8);
     } else {
       await c.turnTo(laserPos.x, laserPos.z);
       setMode('crouch');
@@ -966,6 +994,7 @@ canvas.addEventListener('wheel', (e) => {
   orbit.dist = clamp(orbit.dist * Math.exp(e.deltaY * 0.001), orbit.minDist, 14);
 }, { passive: false });
 document.addEventListener('keydown', (e) => {
+  ensureAudio();
   if (e.code === 'Space' && e.target.tagName !== 'BUTTON') { e.preventDefault(); meow(); }
 });
 
@@ -994,16 +1023,26 @@ function updatePetting(over) {
 // =====================================================================
 //  Sound
 // =====================================================================
-let audio;
+// Browsers only allow sound after the user taps or clicks, so the audio context is created
+// from those handlers. Until then (and in browsers without Web Audio) meows are bubble-only.
+let audio = null, lastGesture = -Infinity;
 function ensureAudio() {
-  audio = audio || new (window.AudioContext || window.webkitAudioContext)();
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) return null;
+  lastGesture = performance.now();
+  audio = audio || new Ctx();
   if (audio.state === 'suspended') audio.resume();
   return audio;
 }
+// any tap or click on the page (buttons included) unlocks sound
+document.addEventListener('pointerdown', ensureAudio, true);
 // a small, high "mew": rising-then-falling pitch through a sweeping vowel filter
 function playMeow() {
-  const a = ensureAudio(), t = a.currentTime;
   const dur = rand(0.45, 0.7), base = rand(620, 820);
+  const a = audio;
+  // a context resumed by this very tap may still report 'suspended' for a moment
+  if (!a || (a.state !== 'running' && performance.now() - lastGesture > 1000)) return dur;
+  const t = a.currentTime;
   const osc = a.createOscillator();
   osc.type = 'sawtooth';
   osc.frequency.setValueAtTime(base * 0.9, t);
@@ -1064,6 +1103,7 @@ function meow() {
 // expose a few internals for testing in the console
 window.kitty = { orbit, cat, C, setMode, restartMode, target, perform, moves, get token() { return token; }, set token(v) { token = v; } };
 
+window.kittyReady = true;
 requestAnimationFrame(loop);
 resumeDefault();
 </script>
