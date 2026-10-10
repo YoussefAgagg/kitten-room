@@ -730,28 +730,33 @@ function clampToArea(x, z) {
   return r > AREA ? [x * AREA / r, z * AREA / r] : [x, z];
 }
 // One frame of walking/running toward a point (shared by moveTo and the laser chase)
-function stepToward(tx, tz, speed, gaitMode, dt, stopDist = 0) {
+function stepToward(tx, tz, speed, gaitMode, dt, stopDist = 0, turnRate = 7, minCos = 0.15) {
   onBed = false;
   const dx = tx - cat.x, dz = tz - cat.z, dist = Math.hypot(dx, dz);
   const d = angDiff(Math.atan2(dx, dz), cat.yaw);
-  cat.yaw += Math.sign(d) * Math.min(Math.abs(d), 7 * dt);
-  const step = clamp(dist - stopDist, 0, speed * dt * Math.max(0.15, Math.cos(d)));
+  cat.yaw += Math.sign(d) * Math.min(Math.abs(d), turnRate * dt);
+  const step = clamp(dist - stopDist, 0, speed * dt * Math.max(minCos, Math.cos(d)));
   [cat.x, cat.z] = clampToArea(cat.x + Math.sin(cat.yaw) * step, cat.z + Math.cos(cat.yaw) * step);
   gait = (gait + step / STRIDE[gaitMode]) % 1;
 }
 
-let userBusy = false;
+let userBusy = false, failures = 0;
 async function perform(fn, user = false) {
   const c = makeCtx();
   userBusy = user;
+  if (user) failures = 0;
   try { await fn(c); }
   catch (e) {
     if (e instanceof Cancel) return;
     console.error(e);
-    // recover after a pause (the pause stops a repeating error from spinning)
-    setTimeout(() => { if (c.alive()) { userBusy = false; resumeDefault(); } }, 1000);
+    userBusy = false;
+    setMode('stand');
+    // recover after a pause that grows if the error keeps repeating (1s, 2s, 4s… up to 30s)
+    const delay = Math.min(1000 * 2 ** failures++, 30000);
+    setTimeout(() => { if (c.alive()) resumeDefault(); }, delay);
     return;
   }
+  failures = 0;
   if (c.alive()) { userBusy = false; resumeDefault(); }
 }
 function resumeDefault() { perform(laserOn ? chase : (petting ? petted : roam)); }
@@ -769,6 +774,7 @@ const approach = (P, gap) => {   // a spot `gap` away from P, on the kitten's si
   return [P.x + (dx / d) * gap, P.z + (dz / d) * gap];
 };
 
+let feeding = 0;   // feeds in progress (the fish shows while any is running)
 const moves = {
   async walk(c) { await c.moveTo(...randomSpot(), 0.9); setMode('stand'); await c.wait(400); },
   async run(c)  { await c.moveTo(...randomSpot(), 3.2, 'run'); setMode('stand'); await c.wait(400); },
@@ -823,6 +829,7 @@ const moves = {
     }
   },
   async feed(c) {
+    feeding++;
     fish.visible = true;
     try {
       const [ax, az] = approach(BOWL, 0.75);
@@ -831,7 +838,8 @@ const moves = {
       setMode('eat');
       for (let i = 0; i < 6; i++) { spawn(i % 2 ? '😋' : '💕'); await c.wait(500); }
     } finally {
-      fish.visible = false;
+      // a feed cancelled by a newer feed unwinds after the new one has started, so count them
+      if (--feeding === 0) fish.visible = false;
     }
     setMode('stand'); meow(); await c.wait(800);
   },
@@ -899,7 +907,7 @@ async function chase(c) {
     if (d > 0.9) {
       const gaitMode = d > 2.2 ? 'run' : 'walk';
       setMode(gaitMode);
-      stepToward(laserPos.x, laserPos.z, gaitMode === 'run' ? 3.4 : 1.2, gaitMode, await c.frame(), 0.8);
+      stepToward(laserPos.x, laserPos.z, gaitMode === 'run' ? 3.4 : 1.2, gaitMode, await c.frame(), 0.8, 8, 0.2);
     } else {
       await c.turnTo(laserPos.x, laserPos.z);
       setMode('crouch');
@@ -927,7 +935,7 @@ document.getElementById('colorBtn').addEventListener('click', () => {
   spawn('✨'); spawn('🎨');
 });
 document.querySelectorAll('[data-move]').forEach((btn) => {
-  btn.addEventListener('click', () => { ensureAudio(); perform(moves[btn.dataset.move], true); });
+  btn.addEventListener('click', () => { perform(moves[btn.dataset.move], true); });
 });
 
 // =====================================================================
@@ -945,7 +953,6 @@ function hitTest(e, obj) {
   return raycaster.intersectObject(obj, true).length > 0;
 }
 canvas.addEventListener('pointerdown', (e) => {
-  ensureAudio();
   pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
   dragMoved = 0;
   if (pointers.size === 2) { const [a, b] = [...pointers.values()]; pinchStart = Math.hypot(a.x - b.x, a.y - b.y); }
@@ -1034,14 +1041,25 @@ function ensureAudio() {
   if (audio.state === 'suspended') audio.resume();
   return audio;
 }
-// any tap or click on the page (buttons included) unlocks sound
-document.addEventListener('pointerdown', ensureAudio, true);
+// any tap or click on the page (buttons included) unlocks sound; touch browsers only count
+// pointerup/click as a gesture, so listen for those too
+for (const type of ['pointerdown', 'pointerup', 'click']) document.addEventListener(type, ensureAudio, true);
 // a small, high "mew": rising-then-falling pitch through a sweeping vowel filter
 function playMeow() {
   const dur = rand(0.45, 0.7), base = rand(620, 820);
   const a = audio;
-  // a context resumed by this very tap may still report 'suspended' for a moment
-  if (!a || (a.state !== 'running' && performance.now() - lastGesture > 1000)) return dur;
+  if (!a) return dur;
+  if (a.state !== 'running') {
+    // a context resumed by this very tap may still report 'suspended' for a moment: play once it
+    // starts, but only if that's soon, so a context that never resumes doesn't pile up meows
+    const asked = performance.now();
+    if (asked - lastGesture < 1000) a.resume().then(() => { if (performance.now() - asked < 300) voice(a, dur, base); }, () => {});
+    return dur;
+  }
+  voice(a, dur, base);
+  return dur;
+}
+function voice(a, dur, base) {
   const t = a.currentTime;
   const osc = a.createOscillator();
   osc.type = 'sawtooth';
@@ -1063,7 +1081,6 @@ function playMeow() {
   g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
   osc.connect(fl).connect(g).connect(a.destination);
   osc.start(t); vib.start(t); osc.stop(t + dur); vib.stop(t + dur);
-  return dur;
 }
 
 // =====================================================================
@@ -1104,6 +1121,7 @@ function meow() {
 window.kitty = { orbit, cat, C, setMode, restartMode, target, perform, moves, get token() { return token; }, set token(v) { token = v; } };
 
 window.kittyReady = true;
+document.getElementById('error').style.display = 'none';   // in case the load timeout fired first
 requestAnimationFrame(loop);
 resumeDefault();
 </script>
