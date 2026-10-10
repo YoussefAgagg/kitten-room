@@ -1,6 +1,8 @@
-# 🐾 Purrfect Playroom
+# 🐾 Kitten Room
 
 **A cute 3D kitten you can play with, right in your browser.**
+
+### ▶️ [Play now: kitten-room](https://youssefagagg.github.io/kitten-room/cat.html)
 
 Meet Ginger, a chubby little kitten who lives in a pastel playroom. She wanders around on her own, meows, chases the yarn ball and naps in her bed. You can tap buttons to make her jump, flip, dance and more. It's made for kids, and it's one HTML file with nothing to install.
 
@@ -36,11 +38,13 @@ Every activity starts with a meow. Press <kbd>Space</kbd> to make her meow any t
 
 ## 🚀 Run it
 
-Open `cat.html` in a modern browser (Chrome, Edge, Firefox or Safari). That's all.
+The easiest way is to open the live version: **https://youssefagagg.github.io/kitten-room/cat.html**. It works on computers, phones and tablets, so you can share the link with anyone.
+
+To run it locally, open `cat.html` in a modern browser (Chrome, Edge, Firefox or Safari). That's all.
 
 > **Needs an internet connection.** The 3D engine ([three.js](https://threejs.org/)) and the rounded font load from a CDN.
 
-To open it on a phone or tablet, put the file on any static host (for example GitHub Pages) and visit the link. On small screens the buttons move into a swipeable bar at the bottom.
+The live version is served by GitHub Pages from the `main` branch, so every push updates it within a minute or two. On small screens the buttons move into a swipeable bar at the bottom.
 
 ## 🛠️ How it works
 
